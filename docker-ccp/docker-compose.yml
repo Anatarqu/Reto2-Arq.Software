@@ -1,0 +1,227 @@
+##version: '3.8'
+
+services:
+  # --------------------------------------------------------------------------
+  # 1. PERÍMETRO Y CONTROL DE ACCESO (ASR DISP-02 & SEC-01/02)
+  # --------------------------------------------------------------------------
+  api-gateway:
+    image: nginx:1.25-alpine
+    container_name: ccp-api-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - svc-ventas-main
+      - svc-ventas-spare
+      - ueba-worker
+    networks:
+      - ccp_network
+
+  # --------------------------------------------------------------------------
+  # 2. CAPA DE MENSAJERÍA Y GESTIÓN DE EVENTOS (RabbitMQ Broker)
+  # --------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: ccp-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"    # Protocolo AMQP
+      - "15672:15672"  # Consola de Administración Web (ccp_admin / ccp_pass_2026)
+    volumes:
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    environment:
+      RABBITMQ_DEFAULT_USER: ccp_admin
+      RABBITMQ_DEFAULT_PASS: ccp_pass_2026
+    networks:
+      - ccp_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 3. ALMACÉN EN MEMORIA (Redis: Idempotencia & Blacklist) - (AD-R2 & SEC-01)
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ccp-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    networks:
+      - ccp_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 4. BASE DE DATOS Y AISLAMIENTO FÍSICO RLS (PostgreSQL 15) - (SEC-02 & AD-R2)
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: ccp-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ccp_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - ccp_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ccp_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 5. POOL DE CONEXIONES DE BASE DE DATOS (PgBouncer)
+  # --------------------------------------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: ccp-pgbouncer
+    restart: unless-stopped
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./postgres/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./postgres/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ccp_network
+
+  # --------------------------------------------------------------------------
+  # 6. SERVICIO DE VENTAS - NODO PRINCIPAL (Active) - (AD-D1 & AD-R2)
+  # --------------------------------------------------------------------------
+  svc-ventas-main:
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+    container_name: ccp-svc-ventas-main
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      SERVICE_ROLE: PRIMARY
+      PORT: 8000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ccp_db
+      DB_USER: ccp_app_user
+      DB_PASS: ccp_secure_pass_2026
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ccp_network
+
+  # --------------------------------------------------------------------------
+  # 7. SERVICIO DE VENTAS - NODO STANDBY (Warm Backup Multi-AZ) - (AD-D1)
+  # --------------------------------------------------------------------------
+  svc-ventas-spare:
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+    container_name: ccp-svc-ventas-spare
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    environment:
+      SERVICE_ROLE: SPARE
+      PORT: 8000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ccp_db
+      DB_USER: ccp_app_user
+      DB_PASS: ccp_secure_pass_2026
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ccp_network
+
+  # --------------------------------------------------------------------------
+  # 8. DAEMON DE OBSERVABILIDAD & DETECCIÓN DE CONCESIÓN (Health Monitor Lease) - (AD-D1)
+  # --------------------------------------------------------------------------
+  health-monitor:
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+    container_name: ccp-health-monitor
+    restart: unless-stopped
+    environment:
+      TARGET_URL: http://svc-ventas-main:8000/health/deep
+      PROBE_INTERVAL: 5
+      PROBE_TIMEOUT: 3
+      FAILURE_THRESHOLD: 3
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ccp_admin
+      RABBITMQ_PASS: ccp_pass_2026
+    command: ["python", "health_monitor.py"]
+    depends_on:
+      - svc-ventas-main
+      - rabbitmq
+    networks:
+      - ccp_network
+
+  # --------------------------------------------------------------------------
+  # 9. MOTOR ANALÍTICO DE COMPORTAMIENTO & RIESGO (UEBA Stream Worker) - (SEC-01)
+  # --------------------------------------------------------------------------
+  ueba-worker:
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+    container_name: ccp-ueba-worker
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    environment:
+      PORT: 8005
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ccp_db
+      DB_USER: ccp_app_user
+      DB_PASS: ccp_secure_pass_2026
+    command: ["python", "ueba_worker.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ccp_network
+
+networks:
+  ccp_network:
+    driver: bridge
+
+volumes:
+  pg_data:
+  redis_data:

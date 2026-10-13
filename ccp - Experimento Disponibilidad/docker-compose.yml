@@ -1,0 +1,128 @@
+# Experimento: caída del Servicio de Ventas con redundancia pasiva (warm spare)
+# Arranque:  docker compose up -d --build
+name: ccp
+
+networks:
+  coord:   # etcd + quienes late/lee el líder. Cortar esta red = "partición hacia etcd" (caso C3)
+    name: ccp_coord
+  data:    # PostgreSQL y RabbitMQ
+    name: ccp_data
+  front:   # router, clientes y reprocesador
+    name: ccp_front
+
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.17
+  networks: [coord]
+
+x-app: &app
+  image: ccp-exp:latest
+  build: .
+  env_file: .env
+  depends_on:
+    postgres: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+
+services:
+  # ------------------------------------------------------------ coordinación (3 nodos, consenso Raft)
+  etcd1:
+    <<: *etcd
+    container_name: etcd1
+    command: >-
+      etcd --name etcd1 --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd1:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://etcd1:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      --initial-cluster-token ccp --initial-cluster-state new
+  etcd2:
+    <<: *etcd
+    container_name: etcd2
+    command: >-
+      etcd --name etcd2 --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd2:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://etcd2:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      --initial-cluster-token ccp --initial-cluster-state new
+  etcd3:
+    <<: *etcd
+    container_name: etcd3
+    command: >-
+      etcd --name etcd3 --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd3:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://etcd3:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      --initial-cluster-token ccp --initial-cluster-state new
+
+  # ------------------------------------------------------------ datos y mensajería
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment: { POSTGRES_USER: ccp, POSTGRES_PASSWORD: ccp, POSTGRES_DB: ccp }
+    # idle_in_transaction_session_timeout: si un "zombi" congelado deja una transacción abierta,
+    # la BD la cancela a los 5 s y libera los bloqueos (si no, bloquearía al nuevo líder).
+    command: postgres -c max_connections=200 -c idle_in_transaction_session_timeout=5000
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks: [data]
+    ports: ["15432:5432"]          # para mirar la BD con DBeaver/pgAdmin (usuario ccp / clave ccp)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ccp -d ccp"]
+      interval: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    environment: { RABBITMQ_DEFAULT_USER: ccp, RABBITMQ_DEFAULT_PASS: ccp }
+    networks: [data]
+    ports: ["15672:15672"]         # panel web: http://localhost:15672  (ccp / ccp)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 20
+
+  # ------------------------------------------------------------ la arquitectura bajo prueba
+  ventas-a:
+    <<: *app
+    container_name: ventas-a
+    command: ["python", "-m", "ccp.ventas"]
+    environment: { INSTANCE_ID: ventas-a, FAULT_HOOKS: "1" }
+    networks: [coord, data, front]
+
+  ventas-b:
+    <<: *app
+    container_name: ventas-b
+    command: ["python", "-m", "ccp.ventas"]
+    environment: { INSTANCE_ID: ventas-b, FAULT_HOOKS: "1" }
+    networks: [coord, data, front]
+
+  promotor:
+    <<: *app
+    container_name: promotor
+    command: ["python", "-m", "ccp.promotor"]
+    networks: [coord, data]
+
+  router:
+    <<: *app
+    container_name: router
+    command: ["python", "-m", "ccp.router"]
+    networks: [coord, front]
+    ports: ["8080:8080"]
+
+  reprocesador:
+    <<: *app
+    container_name: reprocesador
+    command: ["python", "-m", "ccp.reprocesador"]
+    networks: [data, front]
+
+  # ------------------------------------------------------------ herramienta del experimento (no arranca con `up`)
+  runner:
+    <<: *app
+    container_name: runner
+    profiles: ["tools"]
+    command: ["python", "-m", "exp.run", "--help"]
+    environment: { RESULTS_DIR: /results }
+    networks: [data, front]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # para matar/pausar/aislar contenedores
+      - ./results:/results                          # resultados visibles en tu carpeta results\
+    depends_on: [router, promotor, reprocesador, ventas-a, ventas-b]

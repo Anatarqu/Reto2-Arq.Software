@@ -1,0 +1,3 @@
+"ccp_app_user" "ccp_secure_pass_2026"
+"ccp_admin" "ccp_admin_pass"
+"postgres" "postgres"
